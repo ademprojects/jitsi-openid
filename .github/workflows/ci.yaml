@@ -13,8 +13,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on:
-  workflow_dispatch: ubuntu-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
@@ -42,8 +41,7 @@ jobs:
 
   docker:
     needs: build
-    runs-on:
-  workflow_dispatch: ubuntu-latest
+    runs-on: ubuntu-latest
     permissions:
       packages: write
     steps:
