@@ -34,6 +34,8 @@ pub(crate) struct Cfg {
   pub(crate) skip_prejoin_screen: Option<bool>,
   #[serde(default)]
   pub(crate) group: String,
+  #[serde(default)]
+  pub(crate) session_ttl_hours: Option<i64>,
 }
 
 fn default_listen_addr() -> SocketAddr {
