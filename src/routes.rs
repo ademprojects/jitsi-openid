@@ -328,7 +328,7 @@ fn id_token_claims(
           return Err(InvalidAccessToken);
         }
       }
-      None => return Err(MissingAccessTokenHash),
+      None => { /* at_hash absent — OPTIONAL per OIDC spec (Section 3.1.3.6) for auth code flow */ }
     };
   }
 
