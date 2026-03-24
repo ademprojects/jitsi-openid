@@ -4,7 +4,7 @@ use axum::routing::get;
 use axum::Router;
 use axum_extra::extract::cookie::Cookie;
 use axum_extra::extract::CookieJar;
-use jsonwebtoken::{EncodingKey, Header};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use openidconnect::core::{CoreAuthenticationFlow, CoreGenderClaim};
 use openidconnect::{
   AccessTokenHash, AuthorizationCode, ConfigurationError, CsrfToken, IdTokenClaims, Nonce,
@@ -13,7 +13,7 @@ use openidconnect::{
 use serde::{self, Serializer};
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::AppError::{AuthenticationContextWasNotFulfilled, IdTokenRequired};
@@ -25,6 +25,7 @@ use crate::{
 };
 
 const COOKIE_NAME: &str = "JITSI_OPENID_SESSION";
+const AUTH_CACHE_COOKIE: &str = "JITSI_AUTH_CACHE";
 
 pub(crate) fn build_routes() -> Router<JitsiState> {
   Router::new()
@@ -35,6 +36,71 @@ pub(crate) fn build_routes() -> Router<JitsiState> {
 async fn room(
   Path(room): Path<String>,
   State(state): State<JitsiState>,
+  jar: CookieJar,
+) -> impl IntoResponse {
+  // Fix #4: Sanitize room name — only allow alphanumeric, hyphens, underscores
+  if !room.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+    warn!("Invalid room name rejected: {}", room);
+    return (jar, Redirect::to(state.config.jitsi_url.as_str())).into_response();
+  }
+
+  // Check for cached auth cookie — skip OIDC if valid JWT exists
+  if let Some(cached_jwt) = jar.get(AUTH_CACHE_COOKIE).map(|c| c.value().to_string()) {
+    // Fix #2+#3: Full JWT validation (signature, expiry, issuer, nbf, audience)
+    let mut validation = Validation::default();
+    validation.set_audience(&["jitsi"]);
+    validation.set_issuer(&["jitsi"]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "nbf"]);
+    validation.leeway = 60; // 60s clock skew tolerance
+
+    match jsonwebtoken::decode::<JitsiClaims>(
+      &cached_jwt,
+      &DecodingKey::from_secret(state.jitsi_secret.0.as_bytes()),
+      &validation,
+    ) {
+      Ok(_claims) => {
+        // JWT is valid — redirect directly to Jitsi with cached JWT
+        let mut url = state.config.jitsi_url.join(&room).unwrap();
+        url.query_pairs_mut().append_pair("jwt", &cached_jwt);
+
+        if state.config.skip_prejoin_screen.unwrap_or(true) {
+          url.set_fragment(Some("config.prejoinConfig.enabled=false"));
+        }
+
+        info!("Auth cache hit — skipping OIDC for room: {}", room);
+        return (jar, Redirect::to(url.as_str())).into_response();
+      }
+      Err(err) => {
+        // Invalid or expired JWT — remove cache cookie, proceed with OIDC
+        // Fix #1: All cookie attributes must match for browser to delete it
+        info!("Auth cache expired/invalid ({}), starting OIDC flow", err);
+        let remove_cookie = Cookie::build((AUTH_CACHE_COOKIE, ""))
+          .domain(
+            state
+              .config
+              .base_url
+              .host()
+              .expect("Missing host in base url")
+              .to_string(),
+          )
+          .path("/oidc/".to_string())
+          .secure(state.config.base_url.scheme() == "https")
+          .http_only(true)
+          .same_site(axum_extra::extract::cookie::SameSite::Lax)
+          .max_age(Duration::ZERO);
+        let jar = jar.add(remove_cookie);
+        return start_oidc_flow(room, state, jar).await.into_response();
+      }
+    }
+  }
+
+  // No cache cookie — start normal OIDC flow
+  start_oidc_flow(room, state, jar).await.into_response()
+}
+
+async fn start_oidc_flow(
+  room: String,
+  state: JitsiState,
   jar: CookieJar,
 ) -> impl IntoResponse {
   let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
@@ -80,7 +146,7 @@ async fn room(
     },
   );
 
-  // Build the cookie
+  // Build the OIDC state cookie
   let cookie = Cookie::build((COOKIE_NAME, session_id.to_string()))
     .domain(
       state
@@ -159,6 +225,7 @@ async fn callback(
     "*".to_string(),
     state.jitsi_secret.0,
     state.config.group,
+    state.config.session_ttl_hours,
   )
   .map_err(|err| {
     error!("Unable to create jwt: {}", err);
@@ -172,7 +239,26 @@ async fn callback(
     url.set_fragment(Some("config.prejoinConfig.enabled=false"));
   }
 
-  Ok(Redirect::to(url.as_str()))
+  // Set auth cache cookie — next room join skips OIDC flow
+  // Cookie is first-party (jitsi.amijaki.de), SameSite=Lax works in iFrames
+  let ttl_hours = state.config.session_ttl_hours.unwrap_or(2);
+  let host = state
+    .config
+    .base_url
+    .host()
+    .expect("Missing host in base url")
+    .to_string();
+  let cache_cookie = Cookie::build((AUTH_CACHE_COOKIE, jwt.clone()))
+    .domain(host)
+    .path("/oidc/".to_string())
+    .secure(state.config.base_url.scheme() == "https")
+    .http_only(true)
+    .same_site(axum_extra::extract::cookie::SameSite::Lax)
+    .max_age(Duration::hours(ttl_hours));
+
+  info!("Auth cache set (TTL: {}h)", ttl_hours);
+
+  Ok((jar.add(cache_cookie), Redirect::to(url.as_str())))
 }
 
 fn id_token_claims(
@@ -299,28 +385,28 @@ async fn user_info_claims(
   }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct JitsiClaims {
   context: JitsiContext,
   aud: String,
   iss: String,
   sub: String,
   room: String,
-  #[serde(serialize_with = "jwt_numeric_date")]
+  #[serde(serialize_with = "jwt_numeric_date", deserialize_with = "jwt_from_numeric_date")]
   nbf: OffsetDateTime,
-  #[serde(serialize_with = "jwt_numeric_date")]
+  #[serde(serialize_with = "jwt_numeric_date", deserialize_with = "jwt_from_numeric_date")]
   iat: OffsetDateTime,
-  #[serde(serialize_with = "jwt_numeric_date")]
+  #[serde(serialize_with = "jwt_numeric_date", deserialize_with = "jwt_from_numeric_date")]
   exp: OffsetDateTime,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct JitsiContext {
   user: JitsiUser,
   group: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct JitsiUser {
   id: String,
   email: Option<String>,
@@ -338,9 +424,12 @@ fn create_jitsi_jwt(
   room: String,
   secret: String,
   group: String,
+  session_ttl_hours: Option<i64>,
 ) -> anyhow::Result<String> {
   let iat = OffsetDateTime::now_utc();
-  let exp = iat + Duration::days(1);
+  // Align JWT exp with session TTL (not 24h) to prevent stale tokens
+  let ttl_hours = session_ttl_hours.unwrap_or(2);
+  let exp = iat + Duration::hours(ttl_hours);
 
   let context = JitsiContext {
     user,
@@ -366,6 +455,14 @@ fn create_jitsi_jwt(
   )?;
 
   Ok(token)
+}
+
+/// Deserializes a Unix timestamp to an OffsetDateTime
+pub fn jwt_from_numeric_date<'de, D: serde::Deserializer<'de>>(
+  deserializer: D,
+) -> Result<OffsetDateTime, D::Error> {
+  let timestamp: i64 = serde::Deserialize::deserialize(deserializer)?;
+  OffsetDateTime::from_unix_timestamp(timestamp).map_err(serde::de::Error::custom)
 }
 
 /// Serializes an OffsetDateTime to a Unix timestamp (milliseconds since 1970/1/1T00:00:00T)
